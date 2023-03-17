@@ -1,7 +1,13 @@
 mod util;
 
-use std::{ cmp, env, fs };
-use std::io::{ self, Read };
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+use std::{ env, fs };
+use std::io::Read;
 use std::borrow::Cow;
 use anyhow::Context;
 use camino::{ Utf8Path as Path, Utf8PathBuf as PathBuf };
@@ -12,8 +18,97 @@ use flate2::bufread::DeflateDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use encoding_rs::Encoding;
 use chardetng::EncodingDetector;
-use zip_parser::{ compress, system, ZipArchive, CentralFileHeader };
-use util::{ Decoder, Crc32Checker, dos2time, path_join, path_open };
+use zip_parser::{ compress, Zip64Archive };
+use util::{ Decoder, Crc32Checker };
+
+use serde::Deserialize;
+use lazy_static::lazy_static;
+use regex::Regex;
+
+/*
+   type SecData struct {
+   Filings struct {
+   Recent SecFilings `json:"recent"`
+   Files []SecFile `json:"files"`
+   } `json:"filings"`
+   }
+   */
+#[derive(Deserialize, Debug)]
+#[serde(rename_all="camelCase")]
+#[allow(dead_code)]
+struct SecData<'a> {
+    #[serde(borrow)]
+    filings: SecRecentFilings<'a>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all="camelCase")]
+#[allow(dead_code)]
+struct SecRecentFilings<'a> {
+    #[serde(borrow)]
+    recent: SecFilings<'a>,
+    #[serde(borrow)]
+    files: Vec<SecFile<'a>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all="camelCase")]
+#[allow(dead_code)]
+struct SecFile<'a> {
+    name: &'a str,
+    filing_count: i64,
+    filing_from: &'a str,
+    filing_to: &'a str,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all="camelCase")]
+#[allow(dead_code)]
+struct SecFilings<'a> {
+    #[serde(borrow)]
+    accession_number: Vec<&'a str>,
+    #[serde(borrow)]
+    filing_date: Vec<&'a str>,
+    #[serde(borrow)]
+    report_date: Vec<&'a str>,
+    #[serde(borrow)]
+    acceptance_date_time: Vec<&'a str>,
+    #[serde(borrow)]
+    act: Vec<&'a str>,
+    #[serde(borrow)]
+    form: Vec<&'a str>,
+    #[serde(borrow)]
+    file_number: Vec<&'a str>,
+    #[serde(borrow)]
+    items: Vec<&'a str>,
+    size: Vec<Option<i64>>,
+    #[serde(rename="isXBRL")]
+    is_xbrl: Vec<i64>,
+    #[serde(rename="isInlineXBRL")]
+    is_inline_xbrl: Vec<i64>,
+    #[serde(borrow)]
+    primary_document: Vec<&'a str>,
+    #[serde(borrow)]
+    primary_doc_description: Vec<Cow<'a, str>>,
+}
+
+/*
+   type SecFiling struct {
+   AccessionNumber string `json:"accessionNumber"`
+   FilingDate string `json:"filingDate"`
+   ReportDate string `json:"reportDate"`
+   AcceptanceDateTime string `json:"acceptanceDateTime"`
+   Act string `json:"act"`
+   Form string `json:"form"`
+   FileNumber string `json:"fileNumber"`
+   Items string `json:"items"`
+   Size int `json:"size"`
+   IsXBRL int `json:"isXBRL"`
+   IsInlineXBRL int `json:"isInlineXBRL"`
+   PrimaryDocument string `json:"primaryDocument"`
+   PrimaryDocDescription string `json:"primaryDocDescription"`
+   }
+   */
 
 
 /// unzipx - extract compressed files in a ZIP archive
@@ -55,6 +150,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn unzip(charset: Option<&'static Encoding>, target_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    lazy_static! {
+        static ref RE: Regex = Regex::new(r"^CIK\d{10}.json$").unwrap();
+    }
+
     println!("Archive: {}", path);
 
     let fd = fs::File::open(path)?;
@@ -62,118 +161,55 @@ fn unzip(charset: Option<&'static Encoding>, target_dir: &Path, path: &Path) -> 
         MmapOptions::new().map_copy_read_only(&fd)?
     };
 
-    let zip = ZipArchive::parse(&buf)?;
-    let len: usize = zip.eocdr().cd_entries.try_into()?;
-    let len = cmp::min(len, 128);
+    /*
+       let buf = fs::read(path)?;
+       println!("read");
+       */
 
-    zip.entries()?
-        .try_fold(Vec::with_capacity(len), |mut acc, e| e.map(|e| {
-            acc.push(e);
-            acc
-        }))?
-        .par_iter()
-        .try_for_each(|cfh| do_entry(charset, &zip, &cfh, target_dir))?;
+    let zip = Zip64Archive::parse(&buf)?;
+    zip.entries()?.par_bridge().for_each(|cfh| {
+        let cfh = cfh.expect("didn't get a cfh");
+        let (_, buf) = zip.read(&cfh).expect("couldn't read");
 
-    Ok(())
-}
-
-fn do_entry(
-    charset: Option<&'static Encoding>,
-    zip: &ZipArchive<'_>,
-    cfh: &CentralFileHeader<'_>,
-    target_dir: &Path
-) -> anyhow::Result<()> {
-    let (_lfh, buf) = zip.read(cfh)?;
-
-    if cfh.gp_flag & 1 != 0 {
-        anyhow::bail!("encrypt is not supported");
-    }
-
-    let name = if let Some(encoding) = charset {
-        let (name, ..) = encoding.decode(cfh.name);
-        name
-    } else if let Ok(name) = std::str::from_utf8(cfh.name) {
-        Cow::Borrowed(name)
-    } else {
-        let mut encoding_detector = EncodingDetector::new();
-        encoding_detector.feed(cfh.name, true);
-        let (name, ..) = encoding_detector.guess(None, false).decode(cfh.name);
-        name
-    };
-    let path = Path::new(&*name);
-
-    if !path.is_relative() {
-        anyhow::bail!("must relative path: {:?}", path);
-    }
-
-    if name.ends_with('/')
-        && cfh.method == compress::STORE
-        && buf.is_empty()
-    {
-        do_dir(target_dir, path)?
-    } else {
-        do_file(cfh, target_dir, path, buf)?;
-    }
-
-    Ok(())
-}
-
-fn do_dir(target_dir: &Path, path: &Path) -> anyhow::Result<()> {
-    let target = path_join(target_dir, path);
-
-    fs::create_dir_all(target)
-        .or_else(|err| if err.kind() == io::ErrorKind::AlreadyExists {
-            Ok(())
+        let name = if let Some(encoding) = charset {
+            let (name, ..) = encoding.decode(cfh.name);
+            name
+        } else if let Ok(name) = std::str::from_utf8(cfh.name) {
+            Cow::Borrowed(name)
         } else {
-            Err(err)
-        })
-        .with_context(|| path.to_owned())?;
+            let mut encoding_detector = EncodingDetector::new();
+            encoding_detector.feed(cfh.name, true);
+            let (name, ..) = encoding_detector.guess(None, false).decode(cfh.name);
+            name
+        };
 
-    println!("   creating: {}", path);
+        if !RE.is_match(&name) {
+            return
+        }
 
-    Ok(())
-}
+        let reader = match cfh.method {
+            compress::STORE => Decoder::None(buf),
+            compress::DEFLATE => Decoder::Deflate(DeflateDecoder::new(buf)),
+            compress::ZSTD => Decoder::Zstd(ZstdDecoder::with_buffer(buf).expect("couldn't create zstd decoder")),
+            _ => panic!("idk"),
+        };
+        // prevent zipbomb
+        let reader = reader.take(cfh.uncomp_size.into());
+        let mut reader = Crc32Checker::new(reader, cfh.crc32);
 
-fn do_file(
-    cfh: &CentralFileHeader,
-    target_dir: &Path,
-    path: &Path,
-    buf: &[u8]
-) -> anyhow::Result<()> {
-    let target = path_join(target_dir, path);
+        let mut data = Vec::with_capacity(cfh.uncomp_size.try_into().unwrap());
+        reader.read_to_end(&mut data).expect("read error");
 
-    let reader = match cfh.method {
-        compress::STORE => Decoder::None(buf),
-        compress::DEFLATE => Decoder::Deflate(DeflateDecoder::new(buf)),
-        compress::ZSTD => Decoder::Zstd(ZstdDecoder::with_buffer(buf)?),
-        _ => anyhow::bail!("compress method is not supported: {}", cfh.method)
-    };
-    // prevent zipbomb
-    let reader = reader.take(cfh.uncomp_size.into());
-    let mut reader = Crc32Checker::new(reader, cfh.crc32);
-
-    let mtime = {
-        let time = dos2time(cfh.mod_date, cfh.mod_time)?.assume_utc();
-        let unix_timestamp = time.unix_timestamp();
-        let nanos = time.nanosecond();
-        filetime::FileTime::from_unix_time(unix_timestamp, nanos)
-    };
-
-    let mut fd = path_open(&target).with_context(|| path.to_owned())?;
-
-    io::copy(&mut reader, &mut fd)?;
-
-    filetime::set_file_handle_times(&fd, None, Some(mtime))?;
-
-    #[cfg(unix)]
-    if cfh.ext_attrs != 0 && cfh.made_by_ver >> 8 == system::UNIX {
-        use std::os::unix::fs::PermissionsExt;
-
-        let perm = fs::Permissions::from_mode(cfh.ext_attrs >> 16);
-        fd.set_permissions(perm)?;
-    }
-
-    println!("  inflating: {}", path);
+        let _: SecData = match simd_json::serde::from_slice(&mut data) {
+            Ok(res) => {
+                res
+            },
+            Err(e) => {
+                println!("{}", e);
+                return
+            },
+        };
+    });
 
     Ok(())
 }
